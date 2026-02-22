@@ -10,12 +10,19 @@ const { RateLimiterMemory } = require('rate-limiter-flexible');
 const crypto = require('crypto');
 
 const app = express();
-app.use(cors({ origin: '*' }));
+
+const corsOptions = {
+  origin: ['https://destrkod.github.io', 'http://localhost:3000', 'http://127.0.0.1:5500'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
-// ────────────────────────────────────────────────
-// Конфиг из .env
-// ────────────────────────────────────────────────
 const {
   PORT = 3000,
   BOT_TOKEN,
@@ -31,14 +38,10 @@ if (!BOT_TOKEN || !JWT_SECRET || !SHOP_ID || !BILEE_PASSWORD) {
   process.exit(1);
 }
 
-// ────────────────────────────────────────────────
-// Хранилища в памяти
-// ────────────────────────────────────────────────
-const users = new Map();                    // phone → { telegram_id, first_name, password_hash, ... }
-const pendingRegistrations = new Map();     // token → { phone, first_name, password, expiresAt, chatId }
-const otpCodes = new Map();                 // phone → { code, expiresAt, attempts }
+const users = new Map();
+const pendingRegistrations = new Map();
+const otpCodes = new Map();
 
-// Rate-limiter на коды
 const codeLimiter = new RateLimiterMemory({
   keyPrefix: 'code',
   points: 3,
@@ -46,9 +49,6 @@ const codeLimiter = new RateLimiterMemory({
   blockDuration: 300,
 });
 
-// ────────────────────────────────────────────────
-// Telegram Bot
-// ────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 bot.onText(/\/start reg_(.+)/, (msg, match) => {
@@ -130,9 +130,6 @@ bot.on('contact', async (msg) => {
   pendingRegistrations.delete(foundToken);
 });
 
-// ────────────────────────────────────────────────
-// Утилиты
-// ────────────────────────────────────────────────
 function normalizePhone(input) {
   try {
     let phone = parsePhoneNumber(input, 'RU');
@@ -156,9 +153,6 @@ function generateSignature(data, password) {
   return crypto.createHash('sha256').update(sortedValues).digest('hex');
 }
 
-// ────────────────────────────────────────────────
-// API — регистрация
-// ────────────────────────────────────────────────
 app.post('/api/register/start', async (req, res) => {
   const { first_name, phone, password, password_confirm } = req.body;
 
@@ -188,7 +182,7 @@ app.post('/api/register/start', async (req, res) => {
 
   const botLink = `https://t.me/dxsconnection_bot?start=reg_${token}`;
 
-  res.json({ success: true, botLink });
+  res.json({ success: true, botLink, token });
 });
 
 app.post('/api/register/verify', async (req, res) => {
@@ -232,9 +226,23 @@ app.post('/api/register/verify', async (req, res) => {
   res.json({ success: true, accessToken, refreshToken });
 });
 
-// ────────────────────────────────────────────────
-// API — вход
-// ────────────────────────────────────────────────
+app.post('/api/register/check', (req, res) => {
+  const { phone } = req.body;
+
+  let normalized;
+  try {
+    normalized = normalizePhone(phone);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  const user = users.get(normalized);
+  
+  res.json({ 
+    confirmed: !!user
+  });
+});
+
 app.post('/api/login', async (req, res) => {
   const { phone, password } = req.body;
 
@@ -306,9 +314,6 @@ app.post('/api/login/verify', (req, res) => {
   res.json({ success: true, accessToken, refreshToken });
 });
 
-// ────────────────────────────────────────────────
-// Bilee Pay — создание платежа
-// ────────────────────────────────────────────────
 app.post('/api/payment/create', async (req, res) => {
   const { amount, order_id = uuidv4().slice(0, 36) } = req.body;
 
@@ -346,9 +351,6 @@ app.post('/api/payment/create', async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────
-// Bilee Notify
-// ────────────────────────────────────────────────
 app.post('/api/notify', (req, res) => {
   const clientIp = req.ip || req.connection.remoteAddress;
   if (clientIp !== BILEE_NOTIFY_IP) {
