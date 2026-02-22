@@ -11,33 +11,21 @@ const crypto = require('crypto');
 
 const app = express();
 
-const corsOptions = {
-  origin: ['https://destrkod.github.io', 'http://localhost:3000', 'http://127.0.0.1:5500'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  credentials: true,
-  optionsSuccessStatus: 200
-};
+// Максимально простая и надёжная настройка CORS
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', 'https://destrkod.github.io');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  
+  next();
+});
 
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
 app.use(express.json());
-app.use((req, res, next) => {
-  console.log('=== REQUEST DEBUG ===');
-  console.log('Method:', req.method);
-  console.log('Path:', req.path);
-  console.log('Origin:', req.headers.origin);
-  console.log('===================');
-  next();
-});
-
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`, {
-    origin: req.headers.origin,
-    body: req.method === 'POST' ? { ...req.body, password: req.body.password ? '[HIDDEN]' : undefined } : undefined
-  });
-  next();
-});
 
 const {
   PORT = 3000,
@@ -57,7 +45,6 @@ if (!BOT_TOKEN || !JWT_SECRET || !SHOP_ID || !BILEE_PASSWORD) {
 const users = new Map();
 const pendingRegistrations = new Map();
 const otpCodes = new Map();
-const registrationTimeouts = new Map();
 
 const codeLimiter = new RateLimiterMemory({
   keyPrefix: 'code',
@@ -78,11 +65,6 @@ bot.onText(/\/start reg_(.+)/, (msg, match) => {
     return;
   }
 
-  if (pending.chatId) {
-    bot.sendMessage(chatId, 'Регистрация уже была начата. Если вы не завершили её, начните заново на сайте.');
-    return;
-  }
-
   pending.chatId = chatId;
 
   bot.sendMessage(chatId, `Привет, ${pending.first_name}! Поделитесь своим номером телефона, чтобы мы убедились, что это вы.`, {
@@ -92,15 +74,6 @@ bot.onText(/\/start reg_(.+)/, (msg, match) => {
       resize_keyboard: true,
     },
   });
-
-  registrationTimeouts.set(token, setTimeout(() => {
-    const stillPending = pendingRegistrations.get(token);
-    if (stillPending && !stillPending.completed) {
-      pendingRegistrations.delete(token);
-      registrationTimeouts.delete(token);
-      bot.sendMessage(chatId, 'Время ожидания истекло. Начните регистрацию заново на сайте.');
-    }
-  }, 10 * 60 * 1000));
 });
 
 bot.on('contact', async (msg) => {
@@ -122,12 +95,6 @@ bot.on('contact', async (msg) => {
   }
 
   const pending = pendingRegistrations.get(foundToken);
-  
-  if (pending.completed) {
-    bot.sendMessage(chatId, 'Регистрация уже завершена. Можете войти на сайте.');
-    return;
-  }
-
   let normalizedTgPhone;
   try {
     normalizedTgPhone = normalizePhone(phoneFromTg);
@@ -158,19 +125,14 @@ bot.on('contact', async (msg) => {
     attempts: 0,
   });
 
-  pending.completed = true;
-
-  if (registrationTimeouts.has(foundToken)) {
-    clearTimeout(registrationTimeouts.get(foundToken));
-    registrationTimeouts.delete(foundToken);
-  }
-
   bot.sendMessage(chatId, `Всё совпало! Ваш код подтверждения: *${code}*\n\nВернитесь на сайт и введите его.`, {
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [[{ text: 'Вернуться на сайт и ввести код', url: `${FRONTEND_URL}/registration.html?token=${foundToken}&stage=verify` }]],
     },
   });
+
+  pendingRegistrations.delete(foundToken);
 });
 
 function normalizePhone(input) {
@@ -203,24 +165,11 @@ app.post('/api/register/start', async (req, res) => {
     return res.status(400).json({ error: 'Заполните все поля или пароли не совпадают' });
   }
 
-  if (first_name.length < 2) {
-    return res.status(400).json({ error: 'Имя должно содержать минимум 2 символа' });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
-  }
-
   let normalized;
   try {
     normalized = normalizePhone(phone);
   } catch (e) {
     return res.status(400).json({ error: e.message });
-  }
-
-  const phoneDigits = phone.replace(/\D/g, '');
-  if (phoneDigits.length < 10) {
-    return res.status(400).json({ error: 'Номер телефона должен содержать минимум 10 цифр' });
   }
 
   if (users.has(normalized)) {
@@ -234,7 +183,6 @@ app.post('/api/register/start', async (req, res) => {
     password,
     expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     chatId: null,
-    completed: false
   });
 
   const botLink = `https://t.me/dxsconnection_bot?start=reg_${token}`;
@@ -245,17 +193,9 @@ app.post('/api/register/start', async (req, res) => {
 app.post('/api/register/verify', async (req, res) => {
   const { token, code } = req.body;
 
-  if (!token || token === 'fallback') {
-    return res.status(400).json({ error: 'Недействительный токен' });
-  }
-
   const pending = pendingRegistrations.get(token);
   if (!pending || pending.expiresAt < Date.now()) {
     return res.status(410).json({ error: 'Регистрация устарела' });
-  }
-
-  if (!pending.completed) {
-    return res.status(400).json({ error: 'Сначала подтвердите номер в Telegram' });
   }
 
   const stored = otpCodes.get(pending.phone);
@@ -281,11 +221,6 @@ app.post('/api/register/verify', async (req, res) => {
   pendingRegistrations.delete(token);
   otpCodes.delete(pending.phone);
 
-  if (registrationTimeouts.has(token)) {
-    clearTimeout(registrationTimeouts.get(token));
-    registrationTimeouts.delete(token);
-  }
-
   const accessToken = jwt.sign({ phone: pending.phone }, JWT_SECRET, { expiresIn: '1h' });
   const refreshToken = jwt.sign({ phone: pending.phone }, JWT_SECRET, { expiresIn: '30d' });
 
@@ -294,10 +229,6 @@ app.post('/api/register/verify', async (req, res) => {
 
 app.post('/api/register/check', (req, res) => {
   const { phone } = req.body;
-
-  if (!phone) {
-    return res.status(400).json({ error: 'Телефон не указан' });
-  }
 
   let normalized;
   try {
@@ -308,31 +239,13 @@ app.post('/api/register/check', (req, res) => {
 
   const user = users.get(normalized);
   
-  let pendingToken = null;
-  for (const [token, data] of pendingRegistrations) {
-    if (data.phone === normalized) {
-      pendingToken = token;
-      break;
-    }
-  }
-
-  const pending = pendingToken ? pendingRegistrations.get(pendingToken) : null;
-  
   res.json({ 
-    confirmed: !!(user && user.telegram_confirmed === true),
-    telegramConfirmed: !!(user && user.telegram_confirmed === true),
-    pending: !!pending,
-    pendingCompleted: pending ? pending.completed : false,
-    token: pendingToken
+    confirmed: !!(user && user.telegram_confirmed === true)
   });
 });
 
 app.post('/api/login', async (req, res) => {
   const { phone, password } = req.body;
-
-  if (!phone || !password) {
-    return res.status(400).json({ error: 'Заполните все поля' });
-  }
 
   let normalized;
   try {
@@ -351,14 +264,10 @@ app.post('/api/login', async (req, res) => {
     return res.status(401).json({ error: 'Неверный пароль' });
   }
 
-  if (!user.telegram_id) {
-    return res.status(403).json({ error: 'Telegram аккаунт не привязан' });
-  }
-
   try {
     await codeLimiter.consume(normalized);
   } catch {
-    return res.status(429).json({ error: 'Слишком много запросов. Попробуйте через 10 минут' });
+    return res.status(429).json({ error: 'Слишком много запросов' });
   }
 
   const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -368,22 +277,13 @@ app.post('/api/login', async (req, res) => {
     attempts: 0,
   });
 
-  try {
-    await bot.sendMessage(user.telegram_id, `Код для входа: *${code}*`, { parse_mode: 'Markdown' });
-  } catch (error) {
-    console.error('Ошибка отправки в Telegram:', error);
-    return res.status(500).json({ error: 'Не удалось отправить код в Telegram' });
-  }
+  bot.sendMessage(user.telegram_id, `Код для входа: *${code}*`, { parse_mode: 'Markdown' });
 
   res.json({ success: true, message: 'Код отправлен в Telegram' });
 });
 
 app.post('/api/login/verify', (req, res) => {
   const { phone, code } = req.body;
-
-  if (!phone || !code) {
-    return res.status(400).json({ error: 'Заполните все поля' });
-  }
 
   let normalized;
   try {
@@ -413,30 +313,6 @@ app.post('/api/login/verify', (req, res) => {
   const refreshToken = jwt.sign({ phone: normalized }, JWT_SECRET, { expiresIn: '30d' });
 
   res.json({ success: true, accessToken, refreshToken });
-});
-
-app.post('/api/token/refresh', (req, res) => {
-  const { refreshToken } = req.body;
-
-  if (!refreshToken) {
-    return res.status(401).json({ error: 'Токен не предоставлен' });
-  }
-
-  try {
-    const decoded = jwt.verify(refreshToken, JWT_SECRET);
-    const user = users.get(decoded.phone);
-
-    if (!user) {
-      return res.status(401).json({ error: 'Пользователь не найден' });
-    }
-
-    const newAccessToken = jwt.sign({ phone: decoded.phone }, JWT_SECRET, { expiresIn: '1h' });
-    const newRefreshToken = jwt.sign({ phone: decoded.phone }, JWT_SECRET, { expiresIn: '30d' });
-
-    res.json({ success: true, accessToken: newAccessToken, refreshToken: newRefreshToken });
-  } catch (error) {
-    return res.status(401).json({ error: 'Недействительный токен' });
-  }
 });
 
 app.post('/api/payment/create', async (req, res) => {
@@ -472,63 +348,36 @@ app.post('/api/payment/create', async (req, res) => {
       res.status(500).json({ error: data.error || 'Ошибка Bilee' });
     }
   } catch (err) {
-    console.error('Ошибка платежа:', err);
-    res.status(500).json({ error: 'Ошибка соединения с платежным шлюзом' });
+    res.status(500).json({ error: 'Ошибка соединения' });
   }
 });
 
 app.post('/api/notify', (req, res) => {
   const clientIp = req.ip || req.connection.remoteAddress;
-  
   if (clientIp !== BILEE_NOTIFY_IP) {
-    console.warn(`Попытка доступа с неразрешенного IP: ${clientIp}`);
     return res.sendStatus(403);
   }
 
   const body = req.body;
   const receivedSignature = body.signature;
 
-  if (!receivedSignature) {
-    return res.sendStatus(400);
-  }
+  if (!receivedSignature) return res.sendStatus(400);
 
   const computed = generateSignature({ ...body, signature: undefined }, BILEE_PASSWORD);
 
   if (computed !== receivedSignature) {
-    console.warn('Неверная подпись уведомления');
     return res.sendStatus(401);
   }
 
-  if (body.status === 'confirmed') {
-    console.log(`Успешный платёж: order_id=${body.order_id}, amount=${body.amount}`);
+  if (body.status !== 'confirmed') {
+    return res.sendStatus(200);
   }
+
+  console.log(`Успешный платёж: order_id=${body.order_id}, amount=${body.amount}`);
 
   res.sendStatus(200);
 });
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    stats: {
-      users: users.size,
-      pending: pendingRegistrations.size,
-      otp: otpCodes.size
-    }
-  });
-});
-
-app.use((err, req, res, next) => {
-  console.error('Необработанная ошибка:', err);
-  res.status(500).json({ error: 'Внутренняя ошибка сервера' });
-});
-
-app.use((req, res) => {
-  res.status(404).json({ error: 'Маршрут не найден' });
-});
-
 app.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
-  console.log(`Разрешенные origins: ${corsOptions.origin.join(', ')}`);
-  console.log(`FRONTEND_URL: ${FRONTEND_URL}`);
 });
