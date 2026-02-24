@@ -8,10 +8,10 @@ const { parsePhoneNumber } = require('libphonenumber-js');
 const { v4: uuidv4 } = require('uuid');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 const crypto = require('crypto');
+const https = require('https');
 
 const app = express();
 
-// Максимально простая и надёжная настройка CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', 'https://destrkod.github.io');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -33,7 +33,7 @@ const {
   JWT_SECRET,
   SHOP_ID,
   BILEE_PASSWORD,
-  FRONTEND_URL = 'https://destrkod.github.io',
+  FRONTEND_URL = 'https://destrkod.github.io/dxsvpn',
   BILEE_NOTIFY_IP = '147.45.247.34',
 } = process.env;
 
@@ -54,6 +54,30 @@ const codeLimiter = new RateLimiterMemory({
 });
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+function keepAlive() {
+  const options = {
+    hostname: 'dxs-server.onrender.com',
+    port: 443,
+    path: '/health',
+    method: 'GET',
+    headers: {
+      'User-Agent': 'Keep-Alive-Service'
+    }
+  };
+
+  const req = https.request(options, (res) => {
+    console.log(`[${new Date().toISOString()}] Keep-alive ping status: ${res.statusCode}`);
+  });
+
+  req.on('error', (error) => {
+    console.error(`[${new Date().toISOString()}] Keep-alive error:`, error.message);
+  });
+
+  req.end();
+}
+
+setInterval(keepAlive, 5 * 60 * 1000);
 
 bot.onText(/\/start reg_(.+)/, (msg, match) => {
   const token = match[1];
@@ -264,6 +288,10 @@ app.post('/api/login', async (req, res) => {
     return res.status(401).json({ error: 'Неверный пароль' });
   }
 
+  if (!user.telegram_id) {
+    return res.status(403).json({ error: 'Telegram аккаунт не привязан' });
+  }
+
   try {
     await codeLimiter.consume(normalized);
   } catch {
@@ -313,6 +341,45 @@ app.post('/api/login/verify', (req, res) => {
   const refreshToken = jwt.sign({ phone: normalized }, JWT_SECRET, { expiresIn: '30d' });
 
   res.json({ success: true, accessToken, refreshToken });
+});
+
+app.get('/api/verify-token', (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Токен не предоставлен' });
+  }
+  
+  const token = authHeader.split(' ')[1];
+  try {
+    jwt.verify(token, JWT_SECRET);
+    res.json({ valid: true });
+  } catch {
+    res.status(401).json({ valid: false, error: 'Недействительный токен' });
+  }
+});
+
+app.post('/api/token/refresh', (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    return res.status(401).json({ error: 'Токен не предоставлен' });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, JWT_SECRET);
+    const user = users.get(decoded.phone);
+
+    if (!user) {
+      return res.status(401).json({ error: 'Пользователь не найден' });
+    }
+
+    const newAccessToken = jwt.sign({ phone: decoded.phone }, JWT_SECRET, { expiresIn: '1h' });
+    const newRefreshToken = jwt.sign({ phone: decoded.phone }, JWT_SECRET, { expiresIn: '30d' });
+
+    res.json({ success: true, accessToken: newAccessToken, refreshToken: newRefreshToken });
+  } catch (error) {
+    return res.status(401).json({ error: 'Недействительный токен' });
+  }
 });
 
 app.post('/api/payment/create', async (req, res) => {
@@ -378,6 +445,21 @@ app.post('/api/notify', (req, res) => {
   res.sendStatus(200);
 });
 
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    stats: {
+      users: users.size,
+      pending: pendingRegistrations.size,
+      otp: otpCodes.size
+    }
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
+  console.log(`Ссылка: https://dxs-server.onrender.com`);
+  console.log(`Keep-alive активирован (каждые 5 минут)`);
 });
